@@ -1,28 +1,24 @@
-name: Auto Lua Collector
+name: Steam Lua Turbo Collector 🚀
 
 on:
   workflow_dispatch:
     inputs:
       github_token:
-        description: "Optional: GitHub PAT (classic). If empty, uses secrets.GITHUB_TOKEN"
-        required: false
-      search_limit:
-        description: "Per-run limit for 'repo-feature search' new files (random sample)"
-        required: false
-        default: "30"
-      max_repos:
-        description: "Max repositories to scan per run (feature search)"
-        required: false
-        default: "120"
+        description: 'GitHub Token (用于搜索仓库)'
+        required: true
+      search_target:
+        description: '全网搜索新增目标数量 (达到即停)'
+        required: true
+        default: '50'
   schedule:
-    # 每天 UTC 16:00 运行（北京时间 00:00）
-    - cron: "0 16 * * *"
+    # 北京时间 00:00 (UTC 16:00)
+    - cron: '0 16 * * *'
 
 permissions:
   contents: write
 
 jobs:
-  collect-job:
+  turbo-job:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Local Repository
@@ -31,481 +27,265 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.10"
+          python-version: '3.10'
 
       - name: Install Dependencies
         run: |
           pip install PyGithub requests
 
-      - name: Run Collector Script
+      - name: Run Turbo Script
         env:
-          # 手动运行时可输入 token；否则走 secrets.GITHUB_TOKEN
           USER_INPUT_TOKEN: ${{ inputs.github_token }}
-          DEFAULT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-          # 这次运行“特征仓库搜索”的新增上限（随机抽样）
-          SEARCH_LIMIT: ${{ inputs.search_limit || '30' }}
-
-          # 扫多少个仓库就停（性能保护）
-          MAX_REPOS: ${{ inputs.max_repos || '120' }}
+          # 如果是定时任务，默认搜索 20 个，避免超时
+          SEARCH_TARGET: ${{ inputs.search_target || '20' }}
         run: |
           cat << 'EOF' > collector.py
           import os
-          import re
           import time
-          import json
           import shutil
-          import random
           import subprocess
-          from typing import Dict, List, Tuple, Optional, Set
           import requests
-          from github import Github
-          from github.GithubException import GithubException, RateLimitExceededException
+          import concurrent.futures
+          from github import Github, RateLimitExceededException
 
-          # =========================
-          # Config
-          # =========================
+          # === 全局配置 ===
+          SEARCH_TARGET = int(os.environ.get('SEARCH_TARGET', 50))
+          TOKEN = os.environ.get('USER_INPUT_TOKEN')
           SAVE_DIR = "lua_downloads"
           MARKER_FILE = ".luatool_imported"
-
+          
+          # 固定源
           LUATOOL_REPO = "https://github.com/usercat280297/Luatool.git"
           MANIFEST_REPO = "https://github.com/SteamAutoCracks/ManifestHub.git"
 
-          # Feature-search controls
-          SEARCH_LIMIT = int(os.environ.get("SEARCH_LIMIT", "30"))
-          MAX_REPOS = int(os.environ.get("MAX_REPOS", "120"))
+          # 全局计数器
+          search_added_count = 0
 
-          # Performance / safety knobs
-          HTTP_TIMEOUT = 15
-          DOWNLOAD_WORKERS = 8          # 并发下载数（raw），适度即可
-          PER_REPO_TREE_SLEEP = 0.25    # 每个仓库 tree 拉取后短暂停顿
-          PER_RAW_SLEEP = 0.05          # 每次 raw 请求短暂停顿
-          MAX_TREE_ITEMS_PER_REPO = 20000  # 防止超大仓库把你拖死（可调大）
-          RESERVOIR_EXTRA_FACTOR = 6    # 抽样时，为了更随机，最多处理 limit*factor 个通过初筛的候选再停止
+          def log(msg):
+              print(f"[System] {msg}")
 
-          # Keywords (repo feature + lua content)
-          FEATURE_KEYWORDS = ["steam", "manifest"]   # 仓库特征关键字
-          LUA_KEYWORD = "addappid"                  # lua 内容关键字
+          def ensure_dir(path):
+              if not os.path.exists(path):
+                  os.makedirs(path)
 
-          # =========================
-          # Utilities
-          # =========================
-          def log(msg: str):
-            print(f"[System] {msg}", flush=True)
+          def is_numeric_lua(filename):
+              if not filename.endswith('.lua'):
+                  return False
+              name = filename[:-4]
+              return name.isdigit()
 
-          def ensure_dir(path: str):
-            if not os.path.exists(path):
-              os.makedirs(path)
-
-          def is_numeric_lua(filename: str) -> bool:
-            if not filename.endswith(".lua"):
-              return False
-            name = filename[:-4]
-            return name.isdigit()
-
-          def get_local_existing_names() -> Set[str]:
-            if not os.path.exists(SAVE_DIR):
-              return set()
-            s = set()
-            for n in os.listdir(SAVE_DIR):
-              if n.endswith(".lua"):
-                s.add(n)
-            return s
-
-          def choose_token() -> str:
-            user = (os.environ.get("USER_INPUT_TOKEN") or "").strip()
-            if user:
-              return user
-            default = (os.environ.get("DEFAULT_TOKEN") or "").strip()
-            return default
-
-          def case_insensitive_contains(text: str, kw: str) -> bool:
-            return kw.lower() in (text or "").lower()
-
-          # =========================
-          # Rate-limit helpers
-          # =========================
-          def sleep_until(reset_ts: float, buffer_sec: int = 5):
-            now = time.time()
-            sleep_s = int(max(0, reset_ts - now + buffer_sec))
-            if sleep_s > 0:
-              log(f"Rate limit: sleeping {sleep_s}s until reset...")
-              time.sleep(sleep_s)
-
-          def guard_rate_limits(g: Github, for_search: bool = False):
-            """
-            PyGithub: g.get_rate_limit() returns categories (core, search, etc.).
-            我们对 search 更保守一点。
-            """
-            try:
-              rl = g.get_rate_limit()
-              core = rl.core
-              if core.remaining < 20:
-                sleep_until(core.reset.timestamp(), buffer_sec=10)
-
-              if for_search:
-                srch = rl.search
-                if srch.remaining < 5:
-                  sleep_until(srch.reset.timestamp(), buffer_sec=10)
-            except Exception:
-              # 不要因为限流检查失败而中断
-              pass
-
-          # =========================
-          # Task 1: Luatool (logic unchanged)
-          # =========================
-          def process_luatool():
-            if os.path.exists(MARKER_FILE):
-              log("Luatool 已标记完成，跳过")
-              return
-
-            log("--- [无限制] 开始处理 Luatool ---")
-            temp_dir = "temp_luatool"
-            count = 0
-            try:
-              if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-              subprocess.run(
-                ["git", "clone", "--depth=1", LUATOOL_REPO, temp_dir],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-              )
-
-              source_folder = os.path.join(temp_dir, "lua_files")
-              if os.path.exists(source_folder):
-                for fname in os.listdir(source_folder):
-                  if is_numeric_lua(fname):
-                    dst = os.path.join(SAVE_DIR, fname)
-                    if os.path.exists(dst):
-                      continue
-                    src = os.path.join(source_folder, fname)
-                    try:
-                      with open(src, "r", encoding="utf-8", errors="ignore") as f:
-                        if LUA_KEYWORD in f.read():
-                          shutil.copy2(src, dst)
-                          count += 1
-                    except:
-                      pass
-
-              log(f"Luatool 处理完成，本次新增: {count} 个")
-              with open(MARKER_FILE, "w") as f:
-                f.write("done")
-            except Exception as e:
-              log(f"Luatool Error: {e}")
-            finally:
-              if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-
-          # =========================
-          # Task 2: ManifestHub (logic unchanged)
-          # =========================
-          def process_manifesthub():
-            log("--- [无限制] 开始同步 ManifestHub ---")
-            count = 0
-            temp_repo = "temp_manifesthub"
-            try:
-              # 获取远程所有分支
-              result = subprocess.run(
-                ["git", "ls-remote", "--heads", MANIFEST_REPO],
-                capture_output=True,
-                text=True,
-              )
-              lines = result.stdout.splitlines()
-              branches_to_fetch = []
-
-              # 筛选出本地没有的纯数字分支
-              for line in lines:
-                parts = line.split("\t")
-                if len(parts) > 1:
-                  b_name = parts[1].replace("refs/heads/", "")
-                  if b_name.isdigit():
-                    target_file = os.path.join(SAVE_DIR, f"{b_name}.lua")
-                    if not os.path.exists(target_file):
-                      branches_to_fetch.append(b_name)
-
-              if not branches_to_fetch:
-                log("ManifestHub: 没有需要同步的新分支")
-                return
-
-              # 初始化临时仓库
-              if os.path.exists(temp_repo):
-                shutil.rmtree(temp_repo)
-              os.makedirs(temp_repo, exist_ok=True)
-              subprocess.run(["git", "-C", temp_repo, "init"], check=True, stdout=subprocess.DEVNULL)
-              subprocess.run(["git", "-C", temp_repo, "remote", "add", "origin", MANIFEST_REPO], check=True, stdout=subprocess.DEVNULL)
-
-              # 逐个分支抓取（避免一次性拉太多）
-              for branch in branches_to_fetch:
-                try:
-                  subprocess.run(
-                    ["git", "-C", temp_repo, "fetch", "--depth=1", "origin", branch],
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                  )
-
-                  # 先尝试根目录 {branch}.lua
-                  proc = subprocess.run(
-                    ["git", "-C", temp_repo, "show", f"FETCH_HEAD:{branch}.lua"],
-                    capture_output=True,
-                    text=True,
-                    errors="ignore",
-                  )
-                  content = proc.stdout
-
-                  # 如果根目录没有，尝试查找任意 .lua
-                  if not content:
-                    ls = subprocess.run(
-                      ["git", "-C", temp_repo, "ls-tree", "-r", "--name-only", "FETCH_HEAD"],
-                      capture_output=True,
-                      text=True,
-                    )
-                    for fpath in ls.stdout.splitlines():
-                      if fpath.endswith(".lua"):
-                        content = subprocess.run(
-                          ["git", "-C", temp_repo, "show", f"FETCH_HEAD:{fpath}"],
-                          capture_output=True,
-                          text=True,
-                          errors="ignore",
-                        ).stdout
-                        break
-
-                  if content and LUA_KEYWORD in content:
-                    save_path = os.path.join(SAVE_DIR, f"{branch}.lua")
-                    with open(save_path, "w", encoding="utf-8") as f:
-                      f.write(content)
-                    count += 1
-                except:
-                  pass
-
-              log(f"ManifestHub 同步完成，本次新增: {count} 个")
-            except Exception as e:
-              log(f"ManifestHub Error: {e}")
-            finally:
-              if os.path.exists(temp_repo):
-                shutil.rmtree(temp_repo)
-
-          # =========================
-          # Task 3: Feature repo scan (NEW, replaces global code search)
-          # =========================
-          def build_repo_queries() -> List[str]:
-            """
-            使用 repo search，满足：
-            - name/description/readme 任意包含 steam 或 manifest
-            - 额外加 language:Lua
-            GitHub 文档确认 in: 可包含 README。 
-            """
-            # 注意：Search API 对 OR/AND 的支持有限，最稳是分两次查询再去重
-            queries = []
-            for kw in FEATURE_KEYWORDS:
-              # in:name,description,readme：名字/描述/README 任意匹配
-              queries.append(f"{kw} in:name,description,readme language:Lua")
-            return queries
-
-          def fetch_repo_candidates(g: Github, max_repos: int) -> List:
-            """
-            多 query 合并去重，尽量按 updated 新到旧，提高命中率。
-            """
-            seen = set()
-            repos = []
-            for q in build_repo_queries():
-              guard_rate_limits(g, for_search=True)
-              log(f"[RepoSearch] query={q}")
-              try:
-                results = g.search_repositories(query=q, sort="updated", order="desc")
-                for repo in results:
-                  full = repo.full_name
-                  if full in seen:
-                    continue
-                  seen.add(full)
-                  repos.append(repo)
-                  if len(repos) >= max_repos:
-                    return repos
-              except RateLimitExceededException:
-                # 触发搜索限流就等到重置
-                try:
-                  rl = g.get_rate_limit().search
-                  sleep_until(rl.reset.timestamp(), buffer_sec=10)
-                except:
-                  time.sleep(60)
-              except GithubException as e:
-                log(f"[RepoSearch] GithubException: {e}")
-              except Exception as e:
-                log(f"[RepoSearch] Error: {e}")
-            return repos
-
-          def raw_download_text(session: requests.Session, url: str) -> Optional[str]:
-            try:
-              r = session.get(url, timeout=HTTP_TIMEOUT)
-              if r.status_code == 200:
-                return r.text
-            except:
-              return None
-            return None
-
-          def scan_repo_for_numeric_lua(repo, session: requests.Session, existing: Set[str], reservoir: List[Tuple[str,str,str]]) -> None:
-            """
-            对单仓库：
-              - 拉 tree（一次）
-              - 只挑 numeric.lua
-              - raw 下载验证包含 addappid
-              - 用 reservoir sampling 均匀随机保留 SEARCH_LIMIT 个
-            reservoir item: (filename, content, source_info)
-            """
-            try:
-              # 当前仓库（避免把自己仓库也扫进来）
-              current_repo = os.environ.get("GITHUB_REPOSITORY")
-              if current_repo and repo.full_name == current_repo:
-                return
-
-              # 额外“特征确认”：即便 search 命中，我们也快速检查 repo 名/描述/README 是否满足“任一条件”
-              # （因为 search 可能有噪声/不完整）
-              name_ok = any(case_insensitive_contains(repo.name, kw) for kw in FEATURE_KEYWORDS)
-              desc_ok = any(case_insensitive_contains(getattr(repo, "description", "") or "", kw) for kw in FEATURE_KEYWORDS)
-
-              readme_ok = False
-              if not (name_ok or desc_ok):
-                try:
-                  # 只在必要时拉 README，省 API
-                  rd = repo.get_readme()
-                  # rd.decoded_content 是 bytes
-                  txt = (rd.decoded_content or b"").decode("utf-8", errors="ignore")
-                  readme_ok = any(case_insensitive_contains(txt, kw) for kw in FEATURE_KEYWORDS)
-                except:
-                  readme_ok = False
-
-              if not (name_ok or desc_ok or readme_ok):
-                return
-
-              # 拉 git tree（一次）
-              try:
-                tree = repo.get_git_tree(repo.default_branch, recursive=True).tree
-              except:
-                # 可能 default_branch tree 取不到，直接跳过
-                return
-
-              if not tree:
-                return
-
-              # 超大仓库保护
-              if len(tree) > MAX_TREE_ITEMS_PER_REPO:
-                return
-
-              # 遍历候选
-              passed_prefilter = 0
-              for item in tree:
-                if getattr(item, "type", "") != "blob":
-                  continue
-                path = getattr(item, "path", "")
-                if not path.endswith(".lua"):
-                  continue
-
-                filename = os.path.basename(path)
-                if not is_numeric_lua(filename):
-                  continue
-                if filename in existing:
-                  continue
-
-                # 预筛通过计数
-                passed_prefilter += 1
-                if passed_prefilter > SEARCH_LIMIT * RESERVOIR_EXTRA_FACTOR:
-                  # 为了速度：一个仓库里太多候选，别死磕
-                  break
-
-                raw_url = f"https://raw.githubusercontent.com/{repo.full_name}/{repo.default_branch}/{path}"
-                txt = raw_download_text(session, raw_url)
-                time.sleep(PER_RAW_SLEEP)
-
-                if not txt or (LUA_KEYWORD not in txt):
-                  continue
-
-                # reservoir sampling: 均匀随机保留 SEARCH_LIMIT 个
-                src = f"{repo.full_name}:{path}"
-                if len(reservoir) < SEARCH_LIMIT:
-                  reservoir.append((filename, txt, src))
-                else:
-                  # 经典水库抽样：对第 i 个有效样本（从1开始），以 limit/i 概率替换
-                  # 这里 i 用全局有效样本计数更严谨；简化：用一个大随机也足够接近均匀
-                  j = random.randint(0, max(0, passed_prefilter - 1))
-                  if j < SEARCH_LIMIT:
-                    reservoir[j] = (filename, txt, src)
-
-              time.sleep(PER_REPO_TREE_SLEEP)
-            except Exception:
-              return
-
-          def process_feature_repo_search():
-            token = choose_token()
-            if not token:
-              log("❌ 跳过特征仓库搜索: 没有可用 Token (inputs.github_token 或 secrets.GITHUB_TOKEN)")
-              return 0
-
-            g = Github(token, per_page=50)
-            session = requests.Session()
-
-            existing = get_local_existing_names()
-            reservoir: List[Tuple[str,str,str]] = []
-
-            log(f"--- [有限制] 开始特征仓库搜索: limit={SEARCH_LIMIT}, max_repos={MAX_REPOS} ---")
-
-            repos = fetch_repo_candidates(g, MAX_REPOS)
-            log(f"[RepoSearch] candidates={len(repos)}")
-
-            scanned = 0
-            for repo in repos:
-              scanned += 1
-              guard_rate_limits(g, for_search=False)
-              scan_repo_for_numeric_lua(repo, session, existing, reservoir)
-
-              # 如果水库已满，并且已经扫了足够多仓库，就早点结束（提速）
-              if len(reservoir) >= SEARCH_LIMIT and scanned >= max(10, MAX_REPOS // 4):
-                break
-
-            # 保存水库内容（只保存不覆盖）
-            added = 0
-            for filename, content, src in reservoir:
+          # === 任务 1: 高性能全网仓库搜索 ===
+          def check_and_download_file(file_info):
+              """
+              多线程工作单元：下载并验证单个文件
+              file_info: (raw_url, filename, repo_name)
+              """
+              raw_url, filename, repo_name = file_info
               save_path = os.path.join(SAVE_DIR, filename)
+              
+              # 双重检查（防止线程冲突）
               if os.path.exists(save_path):
-                continue
+                  return False
+
               try:
-                with open(save_path, "w", encoding="utf-8") as f:
-                  f.write(content)
-                added += 1
-                existing.add(filename)
-                log(f"[Feature+1] {filename} <= {src}")
+                  # 设置 5 秒超时，追求速度，慢的直接丢弃
+                  resp = requests.get(raw_url, timeout=5)
+                  if resp.status_code == 200:
+                      content = resp.text
+                      if 'addappid' in content:
+                          # 再次检查文件是否存在（写入锁逻辑简化版）
+                          if not os.path.exists(save_path):
+                              with open(save_path, 'w', encoding='utf-8') as f:
+                                  f.write(content)
+                              return True
               except:
-                pass
+                  pass
+              return False
 
-            log(f"特征仓库搜索完成，本次新增: {added} 个")
-            return added
+          def process_repo_search():
+              global search_added_count
+              if not TOKEN:
+                  log("❌ 无 Token，跳过全网搜索")
+                  return
 
-          # =========================
-          # Main
-          # =========================
-          def main():
-            ensure_dir(SAVE_DIR)
+              log(f"--- 启动全网仓库搜索 (目标新增: {SEARCH_TARGET}) ---")
+              g = Github(TOKEN)
+              
+              # 搜索语法：包含 steam 或 manifest，且语言是 Lua
+              # GitHub 默认会搜索 Name, Description, Readme
+              query = "steam OR manifest language:Lua"
+              
+              try:
+                  # 按更新时间排序，优先看最近活跃的仓库
+                  repos = g.search_repositories(query=query, sort="updated", order="desc")
+                  
+                  # 限制扫描的仓库数量，防止脚本运行几天几夜
+                  repo_scan_limit = 100 
+                  scanned = 0
 
-            # 1) 两个固定源：逻辑不变（不计入 search_limit）
-            process_luatool()
-            process_manifesthub()
+                  for repo in repos:
+                      if search_added_count >= SEARCH_TARGET:
+                          log("🎉 已达到搜索新增目标，停止搜索")
+                          break
+                      
+                      if scanned >= repo_scan_limit:
+                          log("已扫描 100 个仓库，本轮搜索结束")
+                          break
 
-            # 2) 新的“特征仓库”搜索：按 SEARCH_LIMIT 随机新增
-            process_feature_repo_search()
+                      scanned += 1
+                      
+                      # 排除自己
+                      if os.environ.get("GITHUB_REPOSITORY") == repo.full_name:
+                          continue
 
-            log("Job finished.")
+                      try:
+                          # log(f"扫描仓库: {repo.full_name}") # 太吵可以注释
+                          
+                          # 获取仓库文件树 (recursive=True 一次性拉取所有文件)
+                          # 注意：大仓库可能会慢，但比一个一个文件夹点进去快
+                          try:
+                              tree = repo.get_git_tree(repo.default_branch, recursive=True).tree
+                          except:
+                              continue # 可能是空仓库或没权限
 
-          if __name__ == "__main__":
-            main()
+                          # 筛选出所有符合格式的候选文件
+                          candidates = []
+                          for element in tree:
+                              filename = os.path.basename(element.path)
+                              if is_numeric_lua(filename):
+                                  # 只有本地没有的才加入下载队列
+                                  if not os.path.exists(os.path.join(SAVE_DIR, filename)):
+                                      # 构造 raw url
+                                      raw_url = f"https://raw.githubusercontent.com/{repo.full_name}/{repo.default_branch}/{element.path}"
+                                      candidates.append((raw_url, filename, repo.full_name))
+
+                          if not candidates:
+                              continue
+
+                          log(f"🔎 在 {repo.full_name} 发现 {len(candidates)} 个候选文件，并发验证中...")
+
+                          # === 并发加速核心 ===
+                          # 开启 10 个线程同时下载验证
+                          with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                              results = list(executor.map(check_and_download_file, candidates))
+                          
+                          # 统计成功数量
+                          new_in_repo = sum(results)
+                          if new_in_repo > 0:
+                              search_added_count += new_in_repo
+                              log(f"✅ 从该仓库成功捕获 {new_in_repo} 个新文件")
+
+                          # 稍微休息，保护 API
+                          time.sleep(1)
+
+                      except Exception as e:
+                          # print(f"仓库扫描错误: {e}")
+                          continue
+
+              except RateLimitExceededException:
+                  log("API 频率超限，停止搜索")
+              except Exception as e:
+                  log(f"搜索主流程错误: {e}")
+
+          # === 任务 2: Luatool (保持原逻辑) ===
+          def process_luatool():
+              if os.path.exists(MARKER_FILE):
+                  log("Luatool 已标记完成，跳过")
+                  return
+
+              log("--- 处理固定源: Luatool ---")
+              temp_dir = "temp_luatool"
+              count = 0
+              try:
+                  if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
+                  subprocess.run(["git", "clone", "--depth=1", LUATOOL_REPO, temp_dir], check=True, stdout=subprocess.DEVNULL)
+                  
+                  source_folder = os.path.join(temp_dir, "lua_files")
+                  if os.path.exists(source_folder):
+                      for fname in os.listdir(source_folder):
+                          if is_numeric_lua(fname):
+                              dst = os.path.join(SAVE_DIR, fname)
+                              if not os.path.exists(dst):
+                                  src = os.path.join(source_folder, fname)
+                                  try:
+                                      with open(src, 'r', encoding='utf-8', errors='ignore') as f:
+                                          if 'addappid' in f.read():
+                                              shutil.copy2(src, dst)
+                                              count += 1
+                                  except: pass
+                  with open(MARKER_FILE, 'w') as f: f.write("done")
+                  log(f"Luatool 新增: {count}")
+              except Exception as e: log(f"Luatool Error: {e}")
+              finally:
+                  if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
+
+          # === 任务 3: ManifestHub (保持原逻辑) ===
+          def process_manifesthub():
+              log("--- 处理固定源: ManifestHub ---")
+              count = 0
+              try:
+                  result = subprocess.run(["git", "ls-remote", "--heads", MANIFEST_REPO], capture_output=True, text=True)
+                  branches_to_fetch = []
+                  for line in result.stdout.splitlines():
+                      parts = line.split('\t')
+                      if len(parts) > 1:
+                          b_name = parts[1].replace('refs/heads/', '')
+                          if b_name.isdigit() and not os.path.exists(os.path.join(SAVE_DIR, f"{b_name}.lua")):
+                              branches_to_fetch.append(b_name)
+
+                  if branches_to_fetch:
+                      log(f"ManifestHub 发现 {len(branches_to_fetch)} 个新分支，开始同步...")
+                      temp_repo = "temp_manifest"
+                      if not os.path.exists(temp_repo):
+                          os.makedirs(temp_repo)
+                          subprocess.run(["git", "init", temp_repo], stdout=subprocess.DEVNULL)
+                          subprocess.run(["git", "-C", temp_repo, "remote", "add", "origin", MANIFEST_REPO], stdout=subprocess.DEVNULL)
+
+                      batch_size = 50
+                      for i in range(0, len(branches_to_fetch), batch_size):
+                          batch = branches_to_fetch[i:i+batch_size]
+                          subprocess.run(["git", "-C", temp_repo, "fetch", "origin"] + batch + ["--depth=1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                          for branch in batch:
+                              try:
+                                  proc = subprocess.run(["git", "-C", temp_repo, "show", f"FETCH_HEAD:{branch}.lua"], capture_output=True, text=True, errors='ignore')
+                                  content = proc.stdout
+                                  if not content: # 备用查找逻辑
+                                      ls = subprocess.run(["git", "-C", temp_repo, "ls-tree", "-r", "--name-only", "FETCH_HEAD"], capture_output=True, text=True)
+                                      for fpath in ls.stdout.splitlines():
+                                          if fpath.endswith('.lua'):
+                                              content = subprocess.run(["git", "-C", temp_repo, "show", f"FETCH_HEAD:{fpath}"], capture_output=True, text=True, errors='ignore').stdout
+                                              break
+                                  
+                                  if content and 'addappid' in content:
+                                      with open(os.path.join(SAVE_DIR, f"{branch}.lua"), 'w', encoding='utf-8') as f:
+                                          f.write(content)
+                                      count += 1
+                              except: pass
+                      log(f"ManifestHub 新增: {count}")
+              except Exception as e: log(f"ManifestHub Error: {e}")
+              finally:
+                  if os.path.exists(temp_repo): shutil.rmtree(temp_repo)
+
+          # === 主程序 ===
+          ensure_dir(SAVE_DIR)
+          
+          # 1. 优先运行全网仓库搜索 (Token 消耗)
+          process_repo_search()
+
+          # 2. 运行固定源 (0 Token)
+          process_luatool()
+          process_manifesthub()
+          
+          log(f"任务全部完成。")
           EOF
 
           python collector.py
 
       - name: Commit and Push
         run: |
-          git config --global user.name "LuaCollector"
-          git config --global user.email "bot@noreply.github.com"
+          git config --global user.name "LuaTurboBot"
+          git config --global user.email "bot@github.com"
           git add lua_downloads/
           if [ -f .luatool_imported ]; then git add .luatool_imported; fi
-          git commit -m "Auto-update lua collection" || echo "No changes to commit"
+          git commit -m "🚀 Turbo update: Collected new lua files" || echo "No changes"
           git push
