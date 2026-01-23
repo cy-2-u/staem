@@ -3,9 +3,6 @@ name: Steam Lua Progress Collector 📊
 on:
   workflow_dispatch:
     inputs:
-      github_token:
-        description: 'GitHub Token'
-        required: true
       search_target:
         description: '全网搜索目标数量'
         required: true
@@ -36,8 +33,9 @@ jobs:
 
       - name: Run Script with Progress Bar
         env:
-          USER_INPUT_TOKEN: ${{ inputs.github_token }}
-          SEARCH_TARGET: ${{ inputs.search_target || '20' }}
+          # 自动读取 Secret，不再需要用户输入
+          USER_INPUT_TOKEN: ${{ secrets.AUTH_JSON }}
+          SEARCH_TARGET: ${{ inputs.search_target || '50' }}
         run: |
           cat << 'EOF' > collector.py
           import os
@@ -45,21 +43,34 @@ jobs:
           import shutil
           import subprocess
           import requests
+          import json
+          import datetime
           import concurrent.futures
-          from github import Github, Auth, RateLimitExceededException
+          from github import Github, Auth
 
           # === 配置 ===
-          SEARCH_TARGET = int(os.environ.get('SEARCH_TARGET', 20))
-          TOKEN = os.environ.get('USER_INPUT_TOKEN')
+          SEARCH_TARGET = int(os.environ.get('SEARCH_TARGET', 50))
           SAVE_DIR = "lua_downloads"
           MARKER_FILE = ".luatool_imported"
+          LOG_FILE = "update_log.txt"
           
           LUATOOL_REPO = "https://github.com/usercat280297/Luatool.git"
           MANIFEST_REPO = "https://github.com/SteamAutoCracks/ManifestHub.git"
 
-          search_added_count = 0
+          total_added_count = 0
 
-          # 强制刷新日志
+          # === Token 处理 (支持纯字符串或 JSON) ===
+          raw_token = os.environ.get('USER_INPUT_TOKEN', '')
+          TOKEN = raw_token
+          if raw_token.strip().startswith('{'):
+              try:
+                  data = json.loads(raw_token)
+                  # 尝试常见的键名，或者直接取第一个值
+                  TOKEN = data.get('token') or data.get('github_token') or list(data.values())[0]
+                  print("[System] 检测到 JSON 格式密钥，已提取 Token")
+              except:
+                  print("[System] JSON 解析失败，尝试直接使用原始字符串")
+
           def log(msg):
               print(f"[System] {msg}", flush=True)
 
@@ -71,7 +82,7 @@ jobs:
               if not filename.endswith('.lua'): return False
               return filename[:-4].isdigit()
 
-          # === Git 工具 (静音 + 超时) ===
+          # === Git 工具 ===
           def git_run(args, cwd=None, timeout=30):
               try:
                   subprocess.run(
@@ -83,12 +94,13 @@ jobs:
               except:
                   return False
 
-          # === 1. 全网搜索 (修复 Auth 警告) ===
+          # === 1. 全网搜索 (优化版: 针对 README 搜索) ===
           def check_and_download_file(file_info):
               raw_url, filename, repo_name = file_info
               save_path = os.path.join(SAVE_DIR, filename)
               if os.path.exists(save_path): return False
               try:
+                  # 下载文件检查内容
                   resp = requests.get(raw_url, timeout=5)
                   if resp.status_code == 200 and 'addappid' in resp.text:
                       if not os.path.exists(save_path):
@@ -99,29 +111,41 @@ jobs:
               return False
 
           def process_repo_search():
-              global search_added_count
+              global total_added_count
               if not TOKEN: 
-                  log("无 Token，跳过搜索")
+                  log("❌ 无 Token，跳过全网搜索")
                   return
 
               log(f"--- 启动全网搜索 (目标: {SEARCH_TARGET}) ---")
-              # 使用新的 Auth 方式，消除警告
+              
               auth = Auth.Token(TOKEN)
               g = Github(auth=auth)
               
+              # 优化搜索查询：
+              # 1. in:readme -> 只在 README 中查找关键词
+              # 2. steam OR manifest OR lua -> 关键词 (不区分大小写)
+              # 3. language:Lua -> 限制项目主要语言为 Lua，提高准确率
+              query = "steam OR manifest OR lua in:readme language:Lua"
+              
+              current_added = 0
               try:
-                  repos = g.search_repositories(query="steam OR manifest language:Lua", sort="updated", order="desc")
+                  repos = g.search_repositories(query=query, sort="updated", order="desc")
                   scanned = 0
+                  
                   for repo in repos:
-                      if search_added_count >= SEARCH_TARGET or scanned >= 80: break
-                      scanned += 1
+                      if current_added >= SEARCH_TARGET or scanned >= 100: break # 限制扫描上限防止超时
+                      
+                      # 跳过自己
                       if os.environ.get("GITHUB_REPOSITORY") == repo.full_name: continue
-
+                      
+                      scanned += 1
                       try:
+                          # 获取仓库树结构
                           tree = repo.get_git_tree(repo.default_branch, recursive=True).tree
                           candidates = []
                           for element in tree:
                               fname = os.path.basename(element.path)
+                              # 只有文件名是数字的 lua 文件才下载
                               if is_numeric_lua(fname) and not os.path.exists(os.path.join(SAVE_DIR, fname)):
                                   candidates.append((f"https://raw.githubusercontent.com/{repo.full_name}/{repo.default_branch}/{element.path}", fname, repo.full_name))
 
@@ -130,21 +154,29 @@ jobs:
                                   results = list(executor.map(check_and_download_file, candidates))
                               added = sum(results)
                               if added > 0:
-                                  search_added_count += added
+                                  current_added += added
+                                  total_added_count += added
                                   log(f"✅ {repo.full_name} 贡献了 {added} 个")
-                      except: continue
+                      except Exception as e: 
+                          # log(f"跳过仓库 {repo.full_name}: {e}")
+                          continue
               except Exception as e:
                   log(f"搜索中断: {e}")
+              
+              log(f"全网搜索阶段结束，本轮新增: {current_added}")
 
-          # === 2. Luatool (保持不变) ===
+          # === 2. Luatool (保持不变，检查 Marker) ===
           def process_luatool():
+              global total_added_count
               if os.path.exists(MARKER_FILE):
-                  log("Luatool 已完成，跳过")
+                  log("Luatool 标志文件存在，跳过此步骤")
                   return
+              
               log("--- 处理 Luatool ---")
               temp_dir = "temp_luatool"
               count = 0
               if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
+              
               if git_run(["git", "clone", "--depth=1", LUATOOL_REPO, temp_dir]):
                   src_dir = os.path.join(temp_dir, "lua_files")
                   if os.path.exists(src_dir):
@@ -158,12 +190,15 @@ jobs:
                                               shutil.copy2(os.path.join(src_dir, fname), dst)
                                               count += 1
                                   except: pass
+                  # 生成标志文件
                   with open(MARKER_FILE, 'w') as f: f.write("done")
-                  log(f"Luatool 新增: {count}")
+                  total_added_count += count
+                  log(f"Luatool 初始化完成，新增: {count}")
               shutil.rmtree(temp_dir, ignore_errors=True)
 
-          # === 3. ManifestHub (带进度条版) ===
+          # === 3. ManifestHub (进度条版) ===
           def process_manifesthub():
+              global total_added_count
               log("--- 处理 ManifestHub ---")
               count = 0
               temp_repo = "temp_manifest"
@@ -188,32 +223,28 @@ jobs:
                       log("ManifestHub 无新文件")
                       return
 
-                  log(f"ManifestHub 发现 {total_files} 个新文件待下载")
+                  log(f"ManifestHub 发现 {total_files} 个新文件")
 
                   if not os.path.exists(temp_repo):
                       os.makedirs(temp_repo)
                       git_run(["git", "init", temp_repo])
                       git_run(["git", "-C", temp_repo, "remote", "add", "origin", MANIFEST_REPO])
 
-                  # === 进度条逻辑 ===
                   batch_size = 50
                   processed_count = 0
                   
                   for i in range(0, total_files, batch_size):
                       batch = branches[i:i+batch_size]
-                      
-                      # 下载这一批
                       if git_run(["git", "-C", temp_repo, "fetch", "origin"] + batch + ["--depth=1"], timeout=60):
                           for branch in batch:
                               try:
-                                  # 提取文件
                                   proc = subprocess.run(
                                       ["git", "-C", temp_repo, "show", f"FETCH_HEAD:{branch}.lua"], 
                                       capture_output=True, text=True, errors='ignore', timeout=5
                                   )
                                   content = proc.stdout
-                                  # 备用查找
                                   if not content:
+                                      # 备用查找策略
                                       ls = subprocess.run(["git", "-C", temp_repo, "ls-tree", "-r", "--name-only", "FETCH_HEAD"], capture_output=True, text=True, timeout=5).stdout
                                       if ls:
                                           for f in ls.splitlines():
@@ -227,18 +258,12 @@ jobs:
                                       count += 1
                               except: pass
                       
-                      # 更新进度
                       processed_count += len(batch)
-                      percent = (processed_count / total_files) * 100
-                      
-                      # 每 10 批次 (约500个文件) 打印一次日志，避免刷屏太快
-                      # 或者如果到了最后一批，强制打印
-                      if (i // batch_size) % 10 == 0 or processed_count >= total_files:
-                          bar_length = 20
-                          filled_length = int(bar_length * processed_count // total_files)
-                          bar = '█' * filled_length + '░' * (bar_length - filled_length)
-                          log(f"进度: {bar} {percent:.1f}% ({processed_count}/{total_files})")
+                      # 简单的进度日志
+                      if (i // batch_size) % 5 == 0 or processed_count >= total_files:
+                          log(f"ManifestHub 进度: {processed_count}/{total_files}")
 
+                  total_added_count += count
                   log(f"ManifestHub 同步完成，实际新增: {count}")
 
               except Exception as e:
@@ -246,11 +271,25 @@ jobs:
               finally:
                   shutil.rmtree(temp_repo, ignore_errors=True)
 
+          # === 4. 写入统计日志 ===
+          def write_log():
+              date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+              log_line = f"{date_str} Added: {total_added_count} lua\n"
+              
+              # 追加模式写入日志
+              try:
+                  with open(LOG_FILE, 'a', encoding='utf-8') as f:
+                      f.write(log_line)
+                  log(f"日志已更新: {log_line.strip()}")
+              except Exception as e:
+                  log(f"写入日志失败: {e}")
+
           # === 执行 ===
           ensure_dir(SAVE_DIR)
           process_repo_search()
           process_luatool()
           process_manifesthub()
+          write_log()
           log("所有任务执行完毕")
           EOF
 
@@ -261,6 +300,9 @@ jobs:
           git config --global user.name "AutoBot"
           git config --global user.email "bot@github.com"
           git add lua_downloads/
+          # 确保添加日志文件和 marker 文件
+          git add update_log.txt || true
           if [ -f .luatool_imported ]; then git add .luatool_imported; fi
-          git commit -m "Auto update files" || echo "No changes"
+          
+          git commit -m "Auto update: $(date +'%Y-%m-%d')" || echo "No changes"
           git push
